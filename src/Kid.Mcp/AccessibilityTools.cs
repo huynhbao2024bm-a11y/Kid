@@ -14,7 +14,7 @@ public static partial class AccessibilityTools
     private const int MaximumTextLength = 2_000;
     private const int MaximumTreeDepth = 12;
 
-    [McpServerTool(Name = "list_open_windows")]
+    [McpServerTool(Name = "list_open_windows", ReadOnly = true, Destructive = false, OpenWorld = false)]
     [Description("List visible top-level windows exposed by Windows UI Automation, including title, process ID, and native window handle.")]
     public static IReadOnlyList<OpenWindow> ListOpenWindows()
     {
@@ -72,20 +72,21 @@ public static partial class AccessibilityTools
             throw new McpException("The handle does not identify a visible top-level window.");
         }
 
-        if (!NativeMethods.SetForegroundWindow(new IntPtr(nativeWindowHandle)))
+        var requested = new IntPtr(nativeWindowHandle);
+        if (NativeMethods.GetForegroundWindow() != requested)
         {
-            throw new McpException("Windows refused to bring the requested window to the foreground.");
+            NativeMethods.SetForegroundWindow(requested);
         }
 
-        if (NativeMethods.GetForegroundWindow().ToInt32() != nativeWindowHandle)
+        if (!SpinWait.SpinUntil(() => NativeMethods.GetForegroundWindow() == requested, 350))
         {
-            throw new McpException("Windows did not grant foreground focus to the requested window.");
+            throw new McpException("Foreground focus was not observed. Re-list windows before acting or retrying.");
         }
 
         return "Focused window.";
     }
 
-    [McpServerTool(Name = "read_active_window")]
+    [McpServerTool(Name = "read_active_window", ReadOnly = true, Destructive = false, OpenWorld = false)]
     [Description("Read the foreground window's accessibility tree using Windows UI Automation. Includes accessible control text but never reads password fields. Returns truncation and transient-element counts.")]
     public static WindowSnapshot ReadActiveWindow(
         [Description("Maximum number of elements to return (1-300).")] int maxElements = DefaultElementLimit)
@@ -149,9 +150,10 @@ public static partial class AccessibilityTools
     public static string FocusAccessibleElement(
         [Description("Exact accessible name. May be omitted when automationId is provided.")] string? name = null,
         [Description("Exact UI Automation ID; useful when names are duplicated.")] string? automationId = null,
-        [Description("Expected foreground window handle. Supply it to reject changes of target window.")] int? expectedWindowHandle = null)
+        [Description("Expected foreground window handle. Supply it to reject changes of target window.")] int? expectedWindowHandle = null,
+        [Description("Optional observed subtree reference. Uniqueness is checked within that subtree.")] string? scopeRef = null)
     {
-        var target = FindUniqueElement(name, automationId, expectedWindowHandle);
+        var target = FindUniqueElement(name, automationId, expectedWindowHandle, scopeRef);
         EnsureExpectedForegroundWindow(target.WindowHandle);
         EnsureEnabled(target.Element);
         EnsureNotPassword(target.Element);
@@ -173,7 +175,8 @@ public static partial class AccessibilityTools
         [Description("Exact accessible name. May be omitted when automationId is provided.")] string? name = null,
         [Description("Exact UI Automation ID; useful when names are duplicated.")] string? automationId = null,
         [Description("Action to perform: invoke, select, toggle, expand, or collapse. Defaults to invoke; specify toggle or expand/collapse explicitly.")] string action = "invoke",
-        [Description("Expected foreground window handle. Supply it to reject changes of target window.")] int? expectedWindowHandle = null)
+        [Description("Expected foreground window handle. Supply it to reject changes of target window.")] int? expectedWindowHandle = null,
+        [Description("Optional observed subtree reference. Uniqueness is checked within that subtree.")] string? scopeRef = null)
     {
         if (string.IsNullOrWhiteSpace(action))
         {
@@ -181,7 +184,7 @@ public static partial class AccessibilityTools
         }
 
         action = action.Trim().ToLowerInvariant();
-        var target = FindUniqueElement(name, automationId, expectedWindowHandle);
+        var target = FindUniqueElement(name, automationId, expectedWindowHandle, scopeRef);
         EnsureExpectedForegroundWindow(target.WindowHandle);
         EnsureEnabled(target.Element);
         EnsureNotPassword(target.Element);
@@ -275,11 +278,12 @@ public static partial class AccessibilityTools
         [Description("Text to set on the matched control.")] string text,
         [Description("Exact accessible name. May be omitted when automationId is provided.")] string? name = null,
         [Description("Exact UI Automation ID; useful when names are duplicated.")] string? automationId = null,
-        [Description("Expected foreground window handle. Supply it to reject changes of target window.")] int? expectedWindowHandle = null)
+        [Description("Expected foreground window handle. Supply it to reject changes of target window.")] int? expectedWindowHandle = null,
+        [Description("Optional observed subtree reference. Uniqueness is checked within that subtree.")] string? scopeRef = null)
     {
         ArgumentNullException.ThrowIfNull(text);
 
-        var target = FindUniqueElement(name, automationId, expectedWindowHandle);
+        var target = FindUniqueElement(name, automationId, expectedWindowHandle, scopeRef);
         EnsureExpectedForegroundWindow(target.WindowHandle);
         SetElementText(target.Element, text, target.WindowHandle);
         return "Text set on the matched control.";
@@ -431,7 +435,9 @@ public static partial class AccessibilityTools
         }
     }
 
-    private static (AutomationElement Element, int WindowHandle) FindUniqueElement(string? name, string? automationId, int? expectedWindowHandle = null)
+    internal static (AutomationElement Element, int WindowHandle) FindUniqueElement(
+        string? name, string? automationId, int? expectedWindowHandle, string? scopeRef,
+        int maximumDepth = MaximumTreeDepth)
     {
         if (string.IsNullOrWhiteSpace(name) && string.IsNullOrWhiteSpace(automationId))
         {
@@ -449,18 +455,24 @@ public static partial class AccessibilityTools
         {
             throw new McpException("The foreground window changed before the control search. Inspect it again.");
         }
+        if (scopeRef is not null)
+        {
+            root = CompactAccessibilityTools.ResolveSearchScope(scopeRef, windowHandle);
+        }
         var search = BoundedTreeSearch.Search(
             root,
             GetSearchChildren,
             element => GetMatchState(element, name, automationId),
             MaximumElementLimit,
-            MaximumTreeDepth);
+            scopeRef is null ? maximumDepth : 32);
+        var scopeMatch = scopeRef is null ? BoundedTreeSearch.TreeMatchState.NoMatch : GetMatchState(root, name, automationId);
+        var matches = scopeMatch == BoundedTreeSearch.TreeMatchState.Match ? [root, .. search.Matches] : search.Matches;
         AutomationElement target;
         try
         {
             target = UniqueElementSearchPolicy.Resolve(
-                search.Matches,
-                search.WasTruncated,
+                matches,
+                search.WasTruncated || scopeMatch == BoundedTreeSearch.TreeMatchState.Unavailable,
                 search.SkippedUnavailableElements);
         }
         catch (InvalidOperationException error)
@@ -470,6 +482,10 @@ public static partial class AccessibilityTools
         }
 
         EnsureExpectedForegroundWindow(windowHandle);
+        if (GetMatchState(target, name, automationId) != BoundedTreeSearch.TreeMatchState.Match)
+        {
+            throw new McpException("The matched control changed before the action. Inspect it again.");
+        }
         return (target, windowHandle);
     }
 

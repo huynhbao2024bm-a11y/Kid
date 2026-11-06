@@ -54,9 +54,9 @@ Other clients may use a different configuration format. Use the installed execut
 
 - `project_graph` maps a local source tree to a compact module graph. Call it with an absolute project `root`, optionally a relative `scope`, a `depth` of 1–3, and a `maxChars` budget of 1000–16000.
 - `list_open_windows` lists visible application windows.
-- `read_window` reads a window without changing focus and returns compact lines with short-lived element references. Use `rootRef`, `skip`, and `includeOffscreen` to inspect a subtree or long list. Each line includes depth to preserve hierarchy. A fresh read invalidates older references for that window.
+- `read_window` finds and reads a window by handle or exact unique title without changing focus. It returns compact lines with short-lived element references. Use `rootRef`, `skip`, and `includeOffscreen` for a subtree or long list. Each line includes depth to preserve hierarchy. A fresh read invalidates older references for that window.
 - `inspect_element` reads one referenced control's supported patterns, state and bounded text. Set `includeGeometry: true` for physical screen bounds and a UI Automation clickable point when available. Omit text with `maxTextLength: 0`.
-- `act_on_element` invokes, focuses, selects, expands, collapses, sets text or range values, scrolls, or scrolls an item into view. It verifies the expected foreground window and state where supported. Toggle requests specify the desired boolean state.
+- `act_on_element` invokes, focuses, selects, expands, collapses, sets text or range values, scrolls, or scrolls an item into view. With a known window and control, call it directly with an exact name or automation ID. Reuse an observed element reference when available. It verifies the expected foreground window, rejects ambiguous selectors, and verifies state where supported. Toggle requests specify the desired boolean state.
 - `focus_window` brings a listed window to the foreground.
 - `read_active_window` reads the foreground window's accessible controls and exposed text.
 - `focus_accessible_element` focuses a control by exact name or automation ID.
@@ -64,13 +64,21 @@ Other clients may use a different configuration format. Use the installed execut
 - `set_accessible_text` and `set_focused_text` set text in editable controls.
 - `press_keys` requires `expectedWindowHandle` and sends supported keys or combinations. It rejects password fields, validates every chord before sending any input, and checks the target between chords. Windows can still change focus between a check and input delivery.
 
-Element searches require an exact match. If the accessibility tree is incomplete or more than one control matches, KID does not choose a control for you.
+Element searches require an exact match. For a large window, pass an observed `scopeRef` to the exact-name tools so uniqueness is checked inside that subtree. Ambiguous or incomplete searches fail closed.
 
 Prefer references when names repeat or a window has a large tree. References are tied to the observed window, process, runtime identity, name, ID and type. They expire after five minutes and are invalidated by KID mutations in that window. Always verify application results after an invoke or keyboard operation. A reported error may follow a partial action, so inspect before retrying.
 
 Compact reads return at most 300 elements and 32,000 characters, visit at most 3,000 nodes, and stop between provider calls after three seconds. Password subtrees are excluded. URL parameters with common secret names are redacted in names and text. Other private data may still be present. MCP calls are serialized, and diagnostic logging goes to stderr so stdout remains valid protocol data.
 
-The project graph groups files by directory and returns module rows (`M`), static dependency rows (`E`), and scan/output limits. Counts on links represent distinct source files. A zero-count module can be a dependency outside the selected scope. It recognizes .NET project links and common local Python and JavaScript/TypeScript imports. Use a narrower scope if the overview is truncated. The scanner skips hidden entries, links, and common build and dependency folders. It scans selected source types without executing project code or returning source bodies. Git ignore rules and runtime dependencies are outside this scanner's coverage.
+Compact window reads report `coverage=partial` when a traversal limit is reached or a page is selected. `frame-only` and `no-content` flag a lack of exposed application content. `provider-tree` means UI Automation exposed content, with possible gaps in visual coverage. For a foreground Chromium window showing only its frame, try one active read and repeat the compact read. If the intended area still exposes no usable structure, the client skill can request a single capture after confirming the target is foreground. Verify both the returned window identity and the image content before using it.
+
+The project graph groups files by directory and returns module rows (`M`), static dependency rows (`E`), and coverage flags. Links count distinct source files. A zero-count module can be a dependency outside the selected scope. The scanner recognizes .NET project links, common Python and JavaScript/TypeScript imports, and common local shell, Makefile and APKBUILD references. It reports unclassified files and unresolved candidates. Shell paths without a recognized directory variable use the project root. The graph reflects supported static references and omits runtime behavior. It skips hidden entries, links, and common build and dependency folders.
+
+## Input modes
+
+- `KID_INPUT_MODE=shared` is the default. Input uses the interactive Windows desktop and requires the intended foreground target.
+- `KID_INPUT_MODE=observe` permits structural reads and project maps. The server refuses focus changes and input even if a client requests them.
+- `KID_INPUT_MODE=isolated` requires `KID_EXPECTED_MACHINE` to match the machine running the server. Run this connection inside an assigned Windows VM or another isolated interactive machine. Provisioning the environment is separate from setting this variable.
 
 ## Build
 
@@ -89,6 +97,8 @@ The server communicates over standard input and output. Normally, let the MCP cl
 ## Verify on a live application
 
 Use `list_open_windows` and `read_window` on an application you can operate. Try a reversible navigation action by element reference and read the window again to verify the new state. For example, Docker Desktop navigation and its local image filter can be checked without changing Docker resources. Clear the filter and restore the original view afterward.
+
+Scoped exact-name actions were also exercised on the live Docker Desktop Search control and sidebar. Blender 4.5.15 reported `frame-only` for its custom-drawn interface. One foreground-verified client capture showed the expected viewport. The skill requires foreground verification and an image content check before using the capture.
 
 ### Response size on Docker Desktop
 

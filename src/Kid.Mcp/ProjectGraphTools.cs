@@ -26,10 +26,10 @@ public static partial class ProjectGraphTools
     private static readonly string[] ScriptExtensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
     private static readonly HashSet<string> SourceExtensions = new(ScriptExtensions.Concat(
         [".cs", ".fs", ".vb", ".py", ".go", ".rs", ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".h", ".hpp",
-         ".rb", ".php", ".vue", ".svelte", ".sql", ".xaml", ".ps1", ".csproj", ".fsproj", ".vbproj", ".slnx", ".sln"]),
+         ".rb", ".php", ".vue", ".svelte", ".sql", ".xaml", ".ps1", ".sh", ".bash", ".mk", ".csproj", ".fsproj", ".vbproj", ".slnx", ".sln"]),
         StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> Manifests = new(
-        ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "Dockerfile", "README.md"],
+        ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml", "Dockerfile", "Makefile", "APKBUILD", "README.md"],
         StringComparer.OrdinalIgnoreCase);
 
     [McpServerTool(Name = "project_graph", ReadOnly = true, Destructive = false, OpenWorld = false)]
@@ -55,8 +55,11 @@ public static partial class ProjectGraphTools
         dirs.Enqueue(folder);
         var examined = 0;
         var files = 0;
+        var unclassified = 0;
         var skipped = 0;
         var parsed = 0;
+        var linkInputs = 0;
+        var unresolved = 0;
         var bytesRead = 0;
         var scanLimited = false;
         var referenceLimited = false;
@@ -83,7 +86,12 @@ public static partial class ProjectGraphTools
                         }
 
                         var extension = Path.GetExtension(entry).ToLowerInvariant();
-                        if (name.StartsWith('.') || !SourceExtensions.Contains(extension) && !Manifests.Contains(name)) continue;
+                        if (name.StartsWith('.')) continue;
+                        if (!SourceExtensions.Contains(extension) && !Manifests.Contains(name))
+                        {
+                            unclassified++;
+                            continue;
+                        }
                         files++;
                         var module = GetModule(ModuleFor(entry));
                         var from = module.Path;
@@ -94,7 +102,14 @@ public static partial class ProjectGraphTools
                             module.Manifest ??= Relative(project, entry);
                         }
 
-                        if (!IsProject(extension) && extension != ".slnx" && extension != ".py" && !ScriptExtensions.Contains(extension)) continue;
+                        var buildKind = name.ToUpperInvariant() switch
+                        {
+                            "APKBUILD" => "apk",
+                            "MAKEFILE" => "make",
+                            _ => extension is ".sh" or ".bash" ? "shell" : extension == ".mk" ? "make" : null
+                        };
+                        if (buildKind is null && !IsProject(extension) && extension != ".slnx" && extension != ".py" && !ScriptExtensions.Contains(extension)) continue;
+                        linkInputs++;
                         var length = new FileInfo(entry).Length;
                         if (length > SourceLimit || bytesRead + length > ReadBudget)
                         {
@@ -111,11 +126,18 @@ public static partial class ProjectGraphTools
                         }
 
                         var links = new HashSet<(string To, string Kind)>();
-                        foreach (var (reference, kind) in ReadReferences(source, extension))
+                        var references = buildKind is null
+                            ? ReadReferences(source, extension)
+                            : BuildReferences.Read(source, buildKind, project, entry);
+                        foreach (var (reference, kind) in references)
                         {
                             if (AtScanLimit()) break;
                             var destination = ResolveReference(project, entry, reference, kind);
-                            if (destination is null) continue;
+                            if (destination is null)
+                            {
+                                unresolved++;
+                                continue;
+                            }
                             var to = GetModule(ModuleFor(destination)).Path;
                             if (from != to) links.Add((to, kind));
                         }
@@ -139,7 +161,8 @@ public static partial class ProjectGraphTools
             }
         }
 
-        return Render(maxChars, Relative(project, folder), modules, edges, files, parsed, skipped, scanLimited, referenceLimited);
+        return Render(maxChars, Relative(project, folder), modules, edges, files, parsed, skipped,
+            scanLimited, referenceLimited, linkInputs, unclassified, unresolved);
 
         bool AtScanLimit()
         {
@@ -198,7 +221,7 @@ public static partial class ProjectGraphTools
         return Path.TrimEndingDirectorySeparator(folder);
     }
 
-    private static string? ResolvePath(string directory, string path)
+    internal static string? ResolvePath(string directory, string path)
     {
         if (string.IsNullOrWhiteSpace(path) || Path.IsPathRooted(path) || path.Contains(':')) return null;
         try
@@ -211,7 +234,7 @@ public static partial class ProjectGraphTools
         }
     }
 
-    private static bool Within(string root, string path) =>
+    internal static bool Within(string root, string path) =>
         string.Equals(root, path, StringComparison.OrdinalIgnoreCase)
         || path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 
@@ -269,6 +292,12 @@ public static partial class ProjectGraphTools
 
     private static string? ResolveReference(string root, string file, string reference, string kind)
     {
+        if (kind is "shell" or "make" or "apk")
+        {
+            var candidate = ResolvePath(root, reference);
+            return candidate is null ? null : Existing(candidate);
+        }
+
         var directory = Path.GetDirectoryName(file)!;
         if (kind == "python")
         {
@@ -302,7 +331,7 @@ public static partial class ProjectGraphTools
 
     private static string Render(int budget, string scope, Dictionary<string, Module> modules,
         Dictionary<(string From, string To, string Kind), int> edges, int files, int parsed, int skipped,
-        bool scanLimited, bool referenceLimited)
+        bool scanLimited, bool referenceLimited, int linkInputs, int unclassified, int unresolved)
     {
         var output = new StringBuilder();
         var ids = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -327,7 +356,11 @@ public static partial class ProjectGraphTools
             if (ids.TryGetValue(edge.From, out var from) && ids.TryGetValue(edge.To, out var to)
                 && Add($"E {from} {to} {edge.Kind} {count}")) shownEdges++;
         }
+        var coverage = parsed == 0 ? "no-link-analysis"
+            : scanLimited || referenceLimited || skipped > 0 || unclassified > 0 || unresolved > 0 ? "partial-static"
+            : "static-only";
         output.Append($"modules={ids.Count}/{modules.Count} edges={shownEdges}/{edges.Count} skipped={skipped} ")
+            .Append($"coverage={coverage} linkInputs={linkInputs} unclassified={unclassified} unresolved={unresolved} ")
             .Append($"scanLimited={scanLimited} referenceLimited={referenceLimited} outputLimited={ids.Count < modules.Count || shownEdges < edges.Count}");
         return output.ToString();
 
